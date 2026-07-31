@@ -13,7 +13,8 @@ def parse_financial_document(text: str) -> str:
         "stock_transactions": [],
         "sip_details": {}
     }
-    
+
+    #new commit
     # Robust regex extraction for POC
     # 1. Stocks: Works for "500 shares of Reliance at 2200 and sold at 2650", "bought Reliance 500 at 2200, sold for 2650", etc.
     
