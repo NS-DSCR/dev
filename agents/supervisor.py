@@ -1,7 +1,10 @@
-from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
+from langchain_core.messages import SystemMessage, AIMessage
 from utils import get_llm
-from typing import List, Optional
-import json
+from typing import List
+import logging
+import re
+
+logger = logging.getLogger(__name__)
 
 class SupervisorAgent:
     def __init__(self, name: str, system_prompt: str, workers: List[str]):
@@ -19,24 +22,49 @@ class SupervisorAgent:
         )
         self.llm = get_llm(temperature=0)
 
+    def _resolve_destination(self, content: str) -> str:
+        """Parse NEXT: command and map to a known worker id or FINISH."""
+        if "NEXT:" not in content:
+            return "FINISH"
+
+        cmd_part = content.split("NEXT:")[-1].strip()
+        # Take the first token / bracketed name after NEXT:
+        token = re.split(r"[\s,.;]+", cmd_part, maxsplit=1)[0].strip("[]()\"'")
+        if not token:
+            return "FINISH"
+
+        upper = token.upper()
+        if upper == "FINISH":
+            return "FINISH"
+
+        # Exact (case-insensitive) match only — avoid substring false positives
+        for w in self.workers:
+            if w.upper() == upper:
+                return w
+
+        # Fallback: full worker id contained as a whole word in the command line
+        for w in self.workers:
+            if re.search(rf"\b{re.escape(w)}\b", cmd_part, re.IGNORECASE):
+                return w
+
+        logger.warning(f"Supervisor could not resolve worker from '{cmd_part}'; defaulting to FINISH")
+        return "FINISH"
+
     def node_func(self, state):
         messages = state.get('messages', [])
         
-        # We invoke the LLM to get reasoning + delegation
-        response = self.llm.invoke([SystemMessage(content=self.system_prompt)] + messages)
-        content = response.content
+        response = self.llm.invoke([SystemMessage(content=self.system_prompt)] + list(messages))
+        content = response.content if isinstance(response.content, str) else str(response.content)
         
-        # Extract the 'NEXT:' command
-        dest = "FINISH"
-        if "NEXT:" in content:
-            cmd_part = content.split("NEXT:")[-1].strip().upper()
-            if "FINISH" in cmd_part:
-                dest = "FINISH"
-            else:
-                for w in self.workers:
-                    if w.upper() in cmd_part:
-                        dest = w
-                        break
+        dest = self._resolve_destination(content)
+
+        if isinstance(response, AIMessage):
+            response.name = self.name
+            response.additional_kwargs = {
+                **(response.additional_kwargs or {}),
+                "agent_name": self.name,
+                "next": dest,
+            }
         
         return {
             "next": dest,

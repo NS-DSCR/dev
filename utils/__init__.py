@@ -66,23 +66,33 @@ def get_llm(temperature: float = 0):
     else:
         raise ValueError(f"Unsupported MODEL_PROVIDER: {provider}")
 
+# Map Studio UI aliases → concrete embedding model ids
+_EMBEDDING_ALIASES = {
+    "openai-3-small": "text-embedding-3-small",
+    "openai-3-large": "text-embedding-3-large",
+    "openai-ada-002": "text-embedding-ada-002",
+    "bedrock-titan": "amazon.titan-embed-text-v1",
+    "bedrock-titan-v1": "amazon.titan-embed-text-v1",
+    "bedrock-titan-v2": "amazon.titan-embed-text-v2:0",
+}
+
+
 def get_embeddings(model_name: Optional[str] = None):
     """
     Returns the appropriate LangChain Embeddings model based on the provider.
     Allows for custom model selection to ensure handshake compatibility.
     """
     provider = os.getenv("MODEL_PROVIDER", "openai").lower()
+    resolved = _EMBEDDING_ALIASES.get(model_name or "", model_name)
     
     if provider == "openai":
         from langchain_openai import OpenAIEmbeddings
-        # default to text-embedding-3-small if none provided
-        return OpenAIEmbeddings(model=model_name or "text-embedding-3-small")
+        return OpenAIEmbeddings(model=resolved or "text-embedding-3-small")
     elif provider in ["bedrock", "nova"]:
         from langchain_aws import BedrockEmbeddings
-        # default to amazon.titan-embed-text-v1
         return BedrockEmbeddings(
             region_name="us-east-1", 
-            model_id=model_name or "amazon.titan-embed-text-v1"
+            model_id=resolved or "amazon.titan-embed-text-v1"
         )
     else:
         return None

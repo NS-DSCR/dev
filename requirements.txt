@@ -7,7 +7,8 @@ langchain-aws
 boto3
 pydantic
 python-dotenv
-faiss-cpu
+python-multipart
+requests
 tiktoken
 langchain-community
 pypdf

@@ -1,7 +1,6 @@
 import os
 import logging
 import io
-import pandas as pd
 from typing import List, Dict, Optional, Any
 from abc import ABC, abstractmethod
 from langchain_community.vectorstores import Chroma
@@ -70,17 +69,24 @@ class PersistentHybridKB(BaseKnowledgeBase):
             text = ""
             if filename.endswith('.pdf'):
                 reader = PdfReader(io.BytesIO(file_content))
-                text = "\n".join([page.extract_text() for page in reader.pages])
+                text = "\n".join([(page.extract_text() or "") for page in reader.pages])
             elif filename.endswith('.docx'):
                 doc = DocxDocument(io.BytesIO(file_content))
-                text = "\n".join([para.text for para in doc.paragraphs])
+                text = "\n".join([para.text for para in doc.paragraphs if para.text])
             elif filename.endswith('.xlsx') or filename.endswith('.xls'):
+                try:
+                    import pandas as pd
+                except ImportError as e:
+                    raise ImportError(
+                        "Excel ingest requires pandas and openpyxl. "
+                        "Install with: pip install pandas openpyxl"
+                    ) from e
                 df = pd.read_excel(io.BytesIO(file_content))
                 text = df.to_string()
             else:
                 text = file_content.decode('utf-8', errors='ignore')
 
-            if text:
+            if text and text.strip():
                 docs = [Document(page_content=text, metadata={"source": filename})]
                 self._process_and_store(docs)
                 return True
@@ -118,13 +124,21 @@ class PersistentHybridKB(BaseKnowledgeBase):
             return "Knowledge base is empty."
 
         # 1. Vector Search
-        vector_results = self.vector_store.similarity_search(query, k=max_sections)
+        try:
+            vector_results = self.vector_store.similarity_search(query, k=max_sections)
+        except Exception as e:
+            logger.error(f"Vector search failed: {e}")
+            vector_results = []
         
-        # 2. BM25 Search
-        tokenized_query = query.lower().split()
-        bm25_scores = self.bm25.get_scores(tokenized_query)
-        bm25_top_indices = sorted(range(len(bm25_scores)), key=lambda i: bm25_scores[i], reverse=True)[:max_sections]
-        bm25_results = [self.chunks[i] for i in bm25_top_indices if bm25_scores[i] > 0]
+        # 2. BM25 Search (optional if index failed to build)
+        bm25_results = []
+        if self.bm25 is not None:
+            tokenized_query = query.lower().split()
+            bm25_scores = self.bm25.get_scores(tokenized_query)
+            bm25_top_indices = sorted(
+                range(len(bm25_scores)), key=lambda i: bm25_scores[i], reverse=True
+            )[:max_sections]
+            bm25_results = [self.chunks[i] for i in bm25_top_indices if bm25_scores[i] > 0]
 
         # 3. Re-rank / Combine (Simplified: Unique union of both)
         combined_results = []
@@ -182,21 +196,48 @@ class RemoteKnowledgeBase(BaseKnowledgeBase):
 
 # Global registry with persistence support
 _KB_REGISTRY: Dict[str, BaseKnowledgeBase] = {}
+# Track content fingerprints so re-orchestration does not duplicate embeddings
+_KB_CONTENT_HASHES: Dict[str, str] = {}
+
 
 def register_agent_kb(agent_id: str, content: str, kb_type: str = "markdown", **kwargs):
-    """Registers a persistent hybrid KB by default now"""
+    """Registers a persistent hybrid KB, reusing the in-memory instance when possible."""
     if kb_type == "remote":
         url = kwargs.get("kb_url")
         if url:
-            _KB_REGISTRY[agent_id] = RemoteKnowledgeBase(kwargs.get("kb_provider", "rest_api"), url, kwargs.get("kb_api_key", ""), source_name=f"Agent-{agent_id}")
+            _KB_REGISTRY[agent_id] = RemoteKnowledgeBase(
+                kwargs.get("kb_provider", "rest_api"),
+                url,
+                kwargs.get("kb_api_key", ""),
+                source_name=f"Agent-{agent_id}",
+            )
         return
 
-    # For local KBs, we use the Hybrid Persistent version
-    kb = PersistentHybridKB(agent_id, embedding_model=kwargs.get("kb_embedding_model"))
+    # Reuse existing hybrid KB for this agent to keep BM25 / vector state in sync
+    existing = _KB_REGISTRY.get(agent_id)
+    if isinstance(existing, PersistentHybridKB):
+        kb = existing
+        # Allow updating the embedding model preference only when creating fresh
+    else:
+        kb = PersistentHybridKB(agent_id, embedding_model=kwargs.get("kb_embedding_model"))
+
     if content:
-        kb.ingest_content(content, "manual_input")
-    
+        import hashlib
+        content_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
+        prev_hash = _KB_CONTENT_HASHES.get(agent_id)
+        if content_hash != prev_hash:
+            kb.ingest_content(content, "manual_input")
+            _KB_CONTENT_HASHES[agent_id] = content_hash
+        else:
+            logger.debug(f"Skipping duplicate KB ingest for agent {agent_id}")
+
     _KB_REGISTRY[agent_id] = kb
+
+
+def register_existing_kb(agent_id: str, kb: BaseKnowledgeBase):
+    """Put an already-built KB (e.g. after file upload) into the live registry."""
+    _KB_REGISTRY[agent_id] = kb
+
 
 def get_agent_kb(agent_id: str) -> Optional[BaseKnowledgeBase]:
     return _KB_REGISTRY.get(agent_id)

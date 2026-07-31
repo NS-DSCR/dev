@@ -18,6 +18,9 @@ from tools.integration_tools import (
     call_marketplace_connector
 )
 from utils.knowledge import register_agent_kb
+import logging
+
+logger = logging.getLogger(__name__)
 
 # Registry of available tools that UI can request
 TOOL_REGISTRY = {
@@ -34,27 +37,54 @@ TOOL_REGISTRY = {
     "marketplace_connector": call_marketplace_connector
 }
 
+VALID_WORKFLOW_MODES = {"sequential", "graph", "supervisor"}
+
+
 def create_dynamic_workflow(agent_configs, workflow_mode="sequential"):
     """
     Builds a LangGraph based on user-defined configurations.
-    Supports 'sequential' and 'supervisor' modes.
+    Supports 'sequential', 'graph', and 'supervisor' modes.
     """
+    if not agent_configs:
+        raise ValueError("At least one agent configuration is required.")
+
+    if workflow_mode not in VALID_WORKFLOW_MODES:
+        raise ValueError(
+            f"Unsupported workflow_mode '{workflow_mode}'. "
+            f"Choose from: {', '.join(sorted(VALID_WORKFLOW_MODES))}"
+        )
+
+    ids = [c["id"] for c in agent_configs]
+    if len(ids) != len(set(ids)):
+        raise ValueError("Agent ids must be unique within a workflow.")
+
+    if workflow_mode == "supervisor" and len(agent_configs) < 2:
+        raise ValueError("Supervisor mode requires at least one supervisor and one worker agent.")
+
     workflow = StateGraph(AgentState)
     node_ids = []
     
     # 1. Register Agents and KBs
-    for config in agent_configs:
+    # In supervisor mode the first config is the supervisor (not a worker DynamicAgent).
+    worker_configs = agent_configs[1:] if workflow_mode == "supervisor" else agent_configs
+
+    for config in worker_configs:
         node_id = config['id']
         node_ids.append(node_id)
         
-        # Resolve tools
-        tools = [TOOL_REGISTRY[t_id] for t_id in config.get('tools', []) if t_id in TOOL_REGISTRY]
+        # Resolve tools (silently skip unknown ids; warn for visibility)
+        tools = []
+        for t_id in config.get('tools', []):
+            if t_id in TOOL_REGISTRY:
+                tools.append(TOOL_REGISTRY[t_id])
+            else:
+                logger.warning(f"Unknown tool id '{t_id}' for agent '{node_id}' — skipped")
         
         # Register KB
         register_agent_kb(
             node_id, 
-            config.get('knowledge_base', ''), 
-            kb_type=config.get('kb_type', 'markdown'),
+            config.get('knowledge_base') or '', 
+            kb_type=config.get('kb_type') or 'markdown',
             kb_provider=config.get('kb_provider'),
             kb_url=config.get('kb_url'),
             kb_api_key=config.get('kb_api_key'),
@@ -72,14 +102,10 @@ def create_dynamic_workflow(agent_configs, workflow_mode="sequential"):
             webhook_url=config.get('webhook_url')
         )
         
-        # Add to graph
         workflow.add_node(node_id, agent.node_func)
         
     # 2. Define Connectivity Logic
-    if not node_ids:
-        workflow.set_entry_point("__end__")
-    
-    elif workflow_mode == "sequential":
+    if workflow_mode == "sequential":
         # Linear flow: 1 -> 2 -> 3 -> END
         workflow.set_entry_point(node_ids[0])
         for i in range(len(node_ids) - 1):
@@ -87,53 +113,44 @@ def create_dynamic_workflow(agent_configs, workflow_mode="sequential"):
         workflow.add_edge(node_ids[-1], END)
         
     elif workflow_mode == "graph":
-        # Explicit Graph Routing (Parallel supported here!)
+        # Explicit Graph Routing (parallel fan-out supported)
         workflow.set_entry_point(node_ids[0])
         for config in agent_configs:
             uid = config['id']
-            next_steps = config.get('downstream_nodes', [])
-            
-            if next_steps:
-                for target in next_steps:
-                    if target in node_ids:
-                        workflow.add_edge(uid, target)
+            next_steps = config.get('downstream_nodes', []) or []
+            valid_targets = [t for t in next_steps if t in node_ids and t != uid]
+
+            if valid_targets:
+                for target in valid_targets:
+                    workflow.add_edge(uid, target)
             else:
-                # If no next steps, go to END
+                # No valid next steps → terminate this branch
                 workflow.add_edge(uid, END)
 
     elif workflow_mode == "supervisor":
-        # Supervisor flow:
-        # The first agent is designated as the Supervisor.
-        # It decides which worker to call.
-        supervisor_id = node_ids[0]
-        worker_ids = node_ids[1:]
-        
-        # Re-register the first node as a Supervisor node
-        # (It replaces the DynamicAgent logic for the first node in supervisor mode)
+        # First agent is the Supervisor; remaining agents are workers.
         supervisor_config = agent_configs[0]
+        worker_ids = node_ids  # already only workers from above
+
         supervisor = SupervisorAgent(
             supervisor_config['name'], 
             supervisor_config['system_prompt'], 
-            [agent_configs[i]['id'] for i in range(1, len(agent_configs))]
+            worker_ids,
         )
         workflow.add_node("supervisor_router", supervisor.node_func)
-        
-        # Entry point is the router
         workflow.set_entry_point("supervisor_router")
         
-        # Map of worker names/ids to graph nodes
         members = {cid: cid for cid in worker_ids}
         members["FINISH"] = END
         
-        # Add conditional edges from supervisor to workers
         workflow.add_conditional_edges(
             "supervisor_router",
-            lambda x: x["next"],
+            lambda x: x.get("next") or "FINISH",
             members
         )
         
-        # Add edges from workers back to supervisor
         for wid in worker_ids:
             workflow.add_edge(wid, "supervisor_router")
             
+    # Cap recursion to prevent infinite supervisor / tool loops from hanging the API
     return workflow.compile()

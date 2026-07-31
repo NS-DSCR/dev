@@ -44,14 +44,22 @@ def parse_financial_document(text: str) -> str:
 @tool
 def calculate_cagr(start_value: float, end_value: float, years: float) -> float:
     """Calculates the Compound Annual Growth Rate (CAGR)."""
-    if years <= 0 or start_value <= 0: return 0.0
+    if years <= 0 or start_value <= 0:
+        return 0.0
+    if end_value < 0:
+        return 0.0
     return ((end_value / start_value) ** (1 / years)) - 1
 
 @tool
 def calculate_sip_future_value(monthly_investment: float, annual_return_rate: float, years: int) -> float:
     """Calculates the Future Value of a Mutual Fund SIP."""
+    if monthly_investment < 0 or years < 0:
+        return 0.0
     i = (annual_return_rate / 100) / 12
     n = years * 12
+    # Zero / near-zero rate: FV is just total contributions
+    if abs(i) < 1e-12:
+        return monthly_investment * n
     # Formula: P * [((1 + i)^n - 1) / i] * (1 + i)
     return monthly_investment * ((((1 + i) ** n) - 1) / i) * (1 + i)
 
@@ -61,7 +69,7 @@ def calculate_stock_returns(buy_price: float, current_price: float, quantity: in
     investment = buy_price * quantity
     current_value = current_price * quantity
     absolute_return = current_value - investment
-    percentage_gain = (absolute_return / investment) * 100 if investment > 0 else 0
+    percentage_gain = (absolute_return / investment) * 100 if investment > 0 else 0.0
     return {
         "investment": investment,
         "current_value": current_value,
