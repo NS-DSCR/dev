@@ -14,14 +14,15 @@ def parse_financial_document(text: str) -> str:
         "sip_details": {}
     }
 
-    #new commit
-    # Robust regex extraction for POC
-    # 1. Stocks: Works for "500 shares of Reliance at 2200 and sold at 2650", "bought Reliance 500 at 2200, sold for 2650", etc.
-    
-    # Look for quantity + shares + name + at + buy_price (+ sold + [optional word] + at/for + sell_price)
-    # Pattern: [qty] shares of [name] at [price] ... sold [optional] at [price]
-    stock_pattern = r"(\d+)\s+shares\s+of\s+([\w\s]+?)\s+at\s+([\d,]+(?:\.\d+)?)(?:.*?sold\s+(?:[\w\s]+?\s+)?(?:at|for)\s+([\d,]+(?:\.\d+)?))?"
-    
+    # 1. Stocks: "500 shares of Reliance at 2200 and sold at 2650"
+    # Match each buy leg on its own; only attach a sell price from the same
+    # transaction (must not span into a later "shares of ..." clause).
+    stock_pattern = (
+        r"(\d+)\s+shares\s+of\s+([A-Za-z][\w]*(?:\s+[A-Za-z][\w]*)*)\s+at\s+"
+        r"([\d,]+(?:\.\d+)?)"
+        r"(?:\s+(?:and\s+)?sold\s+(?:at|for)\s+([\d,]+(?:\.\d+)?))?"
+    )
+
     stock_matches = re.finditer(stock_pattern, text, re.IGNORECASE)
     for m in stock_matches:
         data["stock_transactions"].append({
